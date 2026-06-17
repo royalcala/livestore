@@ -1,43 +1,123 @@
 # SyncBackend sobre Iroh
 
-El `SyncBackend` de LiveStore se adapta para que en vez de comunicarse vía HTTP/WebSocket con un servidor central, lea y escriba directamente del Iroh Doc del tenant.
+El `SyncBackend` de LiveStore se adapta para que en vez de comunicarse vía HTTP/WebSocket con un servidor central, lea y escriba directamente del Iroh Doc de cada org. La sincronización P2P entre dispositivos la maneja Iroh transparentemente.
 
-## Cómo se adapta la interfaz
+## Mapeo de la interfaz
 
-La interfaz `SyncBackend` define cuatro operaciones. Así se mapean a Iroh:
+| Operación SyncBackend | Sobre Iroh Doc |
+|-----------------------|----------------|
+| `push(batch)` | Asigna HLC a cada evento y escribe `doc.setBytes("evt:<ts>:<count>:<node>", event)` en `org_<id>/data` |
+| `pull(cursor, {live})` | `doc.getMany("evt:")`, filtra por cursor. Si `live: true`, suscribe a cambios |
+| `ping` | `iroh.net.ping(doc.id())` o verifica `doc.status()` |
+| `isConnected` | El endpoint iroh reporta peers conectados en el swarm |
 
-| Operación | En servidor tradicional | Sobre Iroh Doc |
-|-----------|------------------------|----------------|
-| `push(batch)` | POST HTTP al server | Asigna HLC a cada evento y escribe `doc.setBytes("eventlog/evt:<hlc>:<node>", event)` |
-| `pull(cursor)` | GET HTTP o stream WS | Itera `doc.getMany("eventlog/")`, filtra por cursor, emite en stream |
-| `live: true` | WebSocket al server | Suscripción a cambios en el doc: eventos nuevos emiten automáticamente |
-| `ping` | Health check HTTP | `iroh.net.ping(doc.id())` |
+## Namespace: uno por org
 
-## Cursor posicional sobre Iroh Docs
+Cada org tiene su propio Iroh Doc para datos transaccionales. El SyncBackend opera sobre el doc de la org activa:
 
-Las keys usan el formato `evt:<HLC_serializado>:<node_id>`, donde el HLC va primero. Esto hace que las keys sean **naturalmente ordenables** en el B-tree de Iroh.
+```
+org_acme/data/
+  evt:00001781655456:00000001:a1b2c3d4...  →  { type: "invoice", hlc: {...}, payload: {...} }
+  evt:00001781655457:00000001:a1b2c3d4...  →  { type: "order", ... }
+  evt:00001781655458:00000002:e5f6a7b8...  →  { type: "invoice", ... }   ← de otro dispositivo
+```
 
-La API pública actual de iroh-docs no expone `KeyFilter::PrefixFrom { prefix, cursor }` (solo `Prefix`, `Exact` y `Any`). Esto significa que para saltar al cursor, `Query::all().key_prefix("evt:")` itera desde el inicio y descarta entradas hasta llegar al offset.
+El prefijo `evt:` es suficiente porque el doc ya está aislado por org (`org_acme/data`). No hace falta prefijar con el org_id dentro de las keys.
 
-**Impacto real:**
+## Push: escribir eventos locales
 
-- El B-tree de Iroh **sí soporta seek posicional a bajo nivel** (`ByKeyBounds`, `RecordsBounds`) — la capacidad existe
-- Para exponerla en la API pública, se necesita extender `QueryBuilder` con `key_prefix_from(prefix, cursor)`. Cambio acotado (~50 líneas en `query.rs`, `bounds.rs`, `store.rs`)
-- Para **MVP con <10k eventos por tenant**, el offset client-side es aceptable: ~1-2ms extra por cada 1000 entradas salteadas
+Cuando LiveStore commitea un batch de eventos:
 
-**Estrategia:** usar `offset` en MVP, contribuir `key_prefix_from` a iroh-docs para producción.
+```
+1. SyncBackend recibe batch = [{name, args, seqNum, clientId, ...}]
+2. Para cada evento:
+   a. Genera HLC { ts: now_us, count: counter++, node: node_id_short }
+   b. Serializa key: "evt:<ts>:<count>:<node>"
+   c. Escribe value: { type: name, hlc: {...}, payload: args, seqNum, clientId }
+   d. doc.setBytes(key, value)
+3. Retorna inmediatamente (escritura local, cero latencia)
+```
 
-## Push: escribir eventos locales al Iroh Doc
+Como la key incluye `<node>` (dispositivo que escribe), dos dispositivos nunca colisionan en la misma key. Sin conflictos CRDT.
 
-Cuando el cliente (vía el backend) commitea eventos, el SyncBackend asigna un HLC nuevo, serializa la clave y escribe en el doc. Como dos nodos nunca escriben la misma clave (el `node_id` es parte de la key), **no hay conflictos CRDT que resolver** — el doc se usa como KV store ordenado.
+## Pull: leer eventos syncronizados
 
-## Pull: leer eventos del Iroh Doc
+```
+1. SyncBackend recibe cursor = { hlc_ts, hlc_count, hlc_node }
+2. Itera doc.getMany("evt:").key_prefix_from("evt:", cursor_key)
+3. Para cada entry encontrada:
+   a. Deserializa el value JSON
+   b. Emite en el stream de pull: { name, args, seqNum, clientId }
+   c. Avanza el cursor
+4. Si live: true, se suscribe a doc.subscribe() y emite nuevos eventos en tiempo real
+```
 
-El cursor es el último HLC procesado. Se escanea el prefijo `eventlog/` descartando entradas anteriores al cursor. Para modo `live: true`, se suscribe a cambios en el doc y emite eventos nuevos automáticamente.
+## Cursor: HLC posicional
 
-## Claves de diseño
+El cursor es el último HLC procesado. Las keys son naturalmente ordenables en el B-tree de Iroh porque el timestamp va primero, luego el contador, luego el node_id:
 
-- **El SyncBackend no hace requests HTTP**: lee y escribe localmente en el Iroh Doc. La sincronización entre nodos la maneja Iroh transparentemente
-- **La latencia es cero para escrituras**: `push` escribe al doc local y retorna inmediato
-- **El orden total lo da el HLC**: las keys son ordenables lexicográficamente
-- **Sin conflictos CRDT**: keys únicas por diseño (HLC + node_id), no hay escrituras concurrentes a la misma key
+```
+evt:00001781655456:00000001:a1b2c3d4
+evt:00001781655456:00000002:a1b2c3d4   ← mismo ts, count mayor
+evt:00001781655457:00000001:e5f6a7b8   ← ts mayor
+```
+
+Esto permite `key_prefix_from("evt:", cursor_key)` para saltar directamente al punto de sincronización. Nuestro fork de iroh-docs (`branch syntrix`) ya incluye el PR `key_prefix_from`.
+
+## Evento completo (wire format)
+
+Cada entry en Iroh Doc contiene el evento serializado más metadatos de sync:
+
+```json
+{
+  "type": "invoice",
+  "hlc": { "ts": 1781655456, "count": 1, "node": "a1b2c3d4e5f6a7b8" },
+  "payload": { "customer_id": "cust-1", "total": 150.0 },
+  "seqNum": 42,
+  "clientId": "client-session-abc",
+  "sessionId": "sess-xyz"
+}
+```
+
+- `seqNum` y `clientId` son requeridos por LiveStore para rebase y detección de duplicados
+- `hlc` es el orden total sin autoridad central
+- `type` y `payload` son el evento de negocio en sí
+
+## Seguridad en capas
+
+El SyncBackend opera dentro de un sistema con tres capas de defensa:
+
+| Capa | Mecanismo | Efecto |
+|------|-----------|--------|
+| **accept_cb** | `iroh-syntrix-docs::accept::make_accept_cb` | Bloquea handshake de dispositivos inactivos. Sin sync, sin datos. |
+| **Capability** | `NamespaceSecret` del doc | Sin capability, no se abre el namespace. El doc ni siquiera se sincroniza. |
+| **Validación local** | `NamespaceRegistry::can_write` | Entradas de writers no autorizados se descartan al materializar. |
+
+El SyncBackend no necesita implementar estas capas — ya están en el stack. Solo lee y escribe del doc.
+
+## Flujo completo
+
+```
+Dispositivo A (Alice crea invoice)
+  → LiveStore commit → Eventlog SQLite + State DB SQLite
+  → SyncBackend.push() → doc.setBytes("evt:...", event)
+  → Iroh sync propaga a otros peers vía gossip
+
+Dispositivo B (Admin ve invoices)
+  → Iroh recibe entry nueva → doc.subscribe() emite evento
+  → SyncBackend.pull() recibe el evento → lo emite como stream
+  → LiveStore materializa en State DB SQLite de B
+  → UI de B reacciona (query reactiva)
+
+Dispositivo C (Bob, revocado — active: false)
+  → accept_cb rechaza su handshake
+  → No recibe sync de ningún namespace
+  → Lo que Bob escriba localmente se queda en su disco
+```
+
+## Lo que NO hace el SyncBackend
+
+- **No maneja autenticación** — el accept_cb y los capabilities ya lo hacen
+- **No maneja autorización por tipo de evento** — la validación local ya lo hace
+- **No hace retry con backoff** — LiveStore ya tiene `backgroundBackendPushing` con exponential backoff
+- **No multiplexa orgs** — opera sobre el doc de la org activa. Cambiar de org = cambiar de doc
