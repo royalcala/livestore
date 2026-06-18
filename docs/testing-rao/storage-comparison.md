@@ -274,3 +274,193 @@ Son **ortogonales**. No dependen uno del otro, pero se complementan:
 | ¿Pueden combinarse? | ✅ Un adapter de TanStack DB podría usar Durable Streams como sync engine | ✅ |
 
 **Ejemplo de combinación:** ElectricSQL (creadores de Durable Streams) son sponsors de TanStack DB. Su adapter `@tanstack/electric-db-collection` integra ambos. Durable Streams mueve los datos, TanStack DB los almacena y consulta.
+
+---
+
+## Arquitectura de Namespaces: cómo encaja con TanStack DB
+
+Arquitectura definida en [`decision.md`](https://github.com/royalcala/livestore/blob/syntrix/docs/testing-rao/decision.md): **namespace por escritor, merge en lectura.**
+
+### Principio
+
+Cada empleado escribe a su PROPIO namespace transaccional. Nadie comparte Write con nadie. Los catálogos compartidos los escribe solo admin. El merge se hace en lectura.
+
+```
+Namespaces por tipo:
+
+Catálogos (1 escritor: admin, N lectores)
+├── org_products         Write: admin      Read: todos
+├── org_customers        Write: admin      Read: todos
+└── org_chart_accounts   Write: admin      Read: todos
+
+Transaccional (1 escritor por namespace)
+├── invoices_alice       Write: alice      Read: admin, contabilidad
+├── invoices_bob         Write: bob        Read: admin, contabilidad
+
+Privado (1 escritor, 1-2 lectores)
+├── user_alice           Write: alice      Read: alice, admin
+└── user_bob             Write: bob        Read: bob, admin
+
+Sensible (1 escritor, pocos lectores)
+└── org_payroll          Write: admin      Read: admin, HR, contabilidad
+```
+
+### Cómo se crean y comparten los namespaces
+
+**1. Admin crea la org** (`syntrix-admin/src-tauri/src/admin.rs:6-32`):
+
+```
+create_org("acme") →
+  Crea control_doc + data_doc
+  Escribe en org_acme/control:
+    members/<admin_node_id>: { active: true, role: "admin", person: "alice" }
+    roles/admin: { can_open: ["*"], can_write: ["*"] }
+    org/: { name: "acme" }
+```
+
+**2. Admin agrega un empleado** (`admin.rs:34-65`):
+
+```
+add_device("bob", "sales", "Bob Martinez") →
+  Escribe members/<bob_node_id>: { active: true, role: "sales", person: "Bob" }
+  Auto-popula role grants:
+    sales: can_open: ["org_data", "org_public", "org_control"], can_write: ["org_data"]
+```
+
+**3. Admin comparte tickets Read** (`admin.rs:100-113`):
+
+```
+share_org_tickets() →
+  Genera Write-mode tickets para control_doc + data_doc
+  Envía al peer vía invite protocol (QUIC ALPN /syntrix/invite/1)
+```
+
+**4. Control namespace define permisos** (`org_<id>/control`):
+
+```json
+{
+  "members/<node_id>": { "active": true, "role": "sales" },
+  "roles/sales": { "can_open": ["org_data", "org_public"], "can_write": ["org_data"] },
+  "namespaces/invoices_bob": {
+    "status": "active",
+    "writers": ["bob_node_id"],
+    "readers": ["alice_node_id", "contabilidad_role"],
+    "capabilities": {
+      "alice_node_id": "<encrypted ticket>",
+      "contabilidad_role": "<encrypted with role key>"
+    }
+  }
+}
+```
+
+**5. Validación de escritura** — 3 capas (`syntrix-client/DESIGN.md:159-167`):
+
+- **Layer 1** — `accept_cb`: sin capability → el peer ni siquiera sincroniza
+- **Layer 2** — local: consulta `org_control`, el rol `sales` tiene `can_write: ["org_data"]`
+- **Layer 3** — otros peers validan y descartan si no coincide
+
+### Cómo funciona el merge (LiveStore/LiveSQL → TanStack DB)
+
+**LiveStore approach (anterior):**
+
+```
+LiveStore → SQLite
+  invoices_view =
+    SELECT * FROM invoices_alice
+    UNION ALL
+    SELECT * FROM invoices_bob
+    UNION ALL ...
+```
+
+**TanStack DB approach (recomendado):** más simple, más eficiente.
+
+Opción A — **una sola collection por tipo de dato:**
+
+```
+adapter sync() carga TODAS las entradas de invoices_* en UNA collection invoices.
+Cada entry tiene campos: { namespace, author, ...payload }
+
+useLiveQuery((q) =>
+  q.from({ invoice: invoicesCollection })
+   .where(({ invoice }) => eq(invoice.status, 'open'))
+   .orderBy(({ invoice }) => invoice.created_at, 'desc')
+)
+```
+
+El adapter `irohCollectionOptions`:
+```typescript
+const sync = ({ begin, write, commit, markReady }) => {
+  // 1. Abre N namespaces de iroh-docs según org_control
+  const namespaces = getReadableNamespaces(orgId, role) 
+  // → ["org_data/invoices_alice", "org_data/invoices_bob", ...]
+
+  // 2. Carga inicial: itera entries de todos los namespaces
+  begin()
+  for (const ns of namespaces) {
+    const entries = invoke('sync_pull', { namespace: ns, cursor: null })
+    for (const entry of entries) {
+      write({ type: 'insert', value: parseEntry(entry, ns) })
+    }
+  }
+  commit()
+  markReady()
+
+  // 3. Subscribe a eventos de iroh-docs para tiempo real
+  listen('data-changed', (event) => {
+    begin()
+    if (event.type === 'new_entry') write({ type: 'insert', value: parseEntry(event) })
+    commit()
+  })
+}
+```
+
+Opción B — **una collection por namespace** (espeja `decision.md` 1:1):
+
+```typescript
+// Cada namespace = una collection separada
+const invoicesAlice = createCollection(irohCollectionOptions({ namespace: 'invoices_alice' }))
+const invoicesBob   = createCollection(irohCollectionOptions({ namespace: 'invoices_bob' }))
+
+// Query mergeada: carga todas las collections relevantes
+useLiveQuery((q) =>
+  q.from({ alice: invoicesAlice, bob: invoicesBob })
+   .where(...)
+   .select(({ alice, bob }) => ({ ... }))
+)
+```
+
+**Recomendación: Opción A** (una collection por tipo). Es más simple, el adapter carga de N namespaces a 1 collection, y TanStack DB mantiene los índices automáticamente. Los 100k invoices caben en differential dataflow sin problema.
+
+### Por qué este diseño evita problemas
+
+| Problema | Solución |
+|----------|----------|
+| Revocación de Write | Nadie comparte Write. Si Bob se va, `invoices_bob` queda como archivo. |
+| Rotación de namespaces | Innecesaria. El namespace del ex-empleado es histórico. |
+| Conductor / SPOF | Inexistente. Cada empleado escribe directo a su namespace. |
+| Datos duplicados | Cada entry vive UNA vez. El adapter mergea en lectura. |
+| Cambio de rol | Solo afecta Read: se agregan/quitan tickets. |
+
+### Despido: qué pasa
+
+```
+1. Admin marca members/bob → { active: false }
+2. Se sync a todos los peers vía gossip
+3. Peer de Bob: deja de recibir updates de la org
+4. Peer de Alice (admin): accept_cb rechaza conexiones de Bob
+5. invoices_bob: intacto como archivo histórico, legible por contabilidad
+6. Datos de OTRAS orgs de Bob: no se tocan (aislamiento multi-org)
+```
+
+## Relación entre Durable Streams y TanStack DB
+
+Son **ortogonales**. No dependen uno del otro, pero se complementan:
+
+| Capa | Durable Streams | TanStack DB |
+|------|----------------|-------------|
+| ¿Qué es? | Protocolo de transporte (HTTP streams) | Store local de datos |
+| ¿Dónde vive? | Servidor HTTP | Cliente (navegador) |
+| ¿Qué resuelve? | Sync, replay, resume | Queries, relaciones, optimistic state |
+| ¿Pueden combinarse? | ✅ Un adapter de TanStack DB podría usar Durable Streams como sync engine | ✅ |
+
+**Ejemplo de combinación:** ElectricSQL (creadores de Durable Streams) son sponsors de TanStack DB. Su adapter `@tanstack/electric-db-collection` integra ambos. Durable Streams mueve los datos, TanStack DB los almacena y consulta.
